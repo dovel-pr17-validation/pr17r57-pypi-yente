@@ -1,0 +1,90 @@
+from collections.abc import AsyncIterable, Iterable
+from typing import Any
+
+
+class SearchProvider:
+    async def close(self) -> None:
+        raise NotImplementedError
+
+    async def set_index_metadata(self, index: str, metadata: dict[str, Any]) -> None:
+        """Replace the index-level metadata dict with `metadata`.
+
+        Note: this is a full replace, not a merge — any keys previously present
+        and not in `metadata` will be removed. Callers must pass the complete
+        desired metadata.
+        """
+        raise NotImplementedError
+
+    async def get_index_metadata(self, index: str) -> dict[str, Any]:
+        """Return the index-level metadata dict, or an empty dict if none is set."""
+        raise NotImplementedError
+
+    async def refresh(self, index: str) -> None:
+        """Refresh the index to make changes visible."""
+        raise NotImplementedError
+
+    async def get_all_indices(self) -> list[str]:
+        """Get a list of all indices in the ElasticSearch cluster."""
+        raise NotImplementedError
+
+    async def get_alias_indices(self, alias: str) -> list[str]:
+        """Get a list of indices that are aliased to the entity query alias."""
+        raise NotImplementedError
+
+    async def rollover_index(self, alias: str, next_index: str, prefix: str) -> None:
+        """Remove all existing indices with a given prefix from the alias and
+        add the new one."""
+        raise NotImplementedError
+
+    async def clone_index(self, base_version: str, target_version: str) -> None:
+        """Create a copy of the index with the given name."""
+        raise NotImplementedError
+
+    async def create_index(
+        self, index: str, mappings: dict[str, Any], settings: dict[str, Any]
+    ) -> None:
+        """Create a new index if it doesn't exist yet."""
+        raise NotImplementedError
+
+    async def delete_index(self, index: str) -> None:
+        """Delete a given index if it exists."""
+        raise NotImplementedError
+
+    async def exists_index_alias(self, alias: str, index: str) -> bool:
+        """Check if an index exists and is linked into the given alias."""
+        raise NotImplementedError
+
+    async def check_health(self, index: str) -> bool:
+        raise NotImplementedError
+
+    async def search(
+        self,
+        index: str,
+        query: dict[str, Any],
+        size: int | None = None,
+        from_: int | None = None,
+        sort: list[Any] | None = None,
+        aggregations: dict[str, Any] | None = None,
+        rank_precise: bool = False,
+        track_total_hits: bool = True,
+    ) -> dict[str, Any]:
+        """Search for entities in the index.
+
+        Pass ``track_total_hits=False`` when the caller never reads
+        ``hits.total``: the backend can then stop counting matches and skip
+        non-competitive documents once the top-``size`` window is full.
+        """
+        raise NotImplementedError
+
+    async def get_document(self, index: str, doc_id: str) -> dict[str, Any] | None:
+        """Get a document by ID using the GET API.
+
+        Returns the document if found, None if not found.
+        """
+        raise NotImplementedError
+
+    async def bulk_index(
+        self, actions: Iterable[dict[str, Any]] | AsyncIterable[dict[str, Any]]
+    ) -> None:
+        """Perform an iterable of bulk actions to the search index."""
+        raise NotImplementedError

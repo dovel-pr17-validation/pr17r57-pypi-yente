@@ -1,0 +1,176 @@
+import json
+import re
+from typing import Any
+
+import pytest
+
+import yente.data
+from yente.data import get_catalog
+from yente.data.loader import ChecksumError
+from yente.data.manifest import Catalog, Manifest
+from yente.data.updater import DatasetUpdater
+from yente.search.versions import build_index_name, get_system_version, parse_index_name
+
+from .conftest import FIXTURES_PATH
+
+
+@pytest.fixture
+def non_mocked_hosts() -> list[str]:
+    return ["localhost"]
+
+
+@pytest.mark.asyncio
+async def test_updater(httpx_mock: Any) -> None:
+    """
+    Test getting the delta versions and updating the index, using the data
+    mocks in the fixtures directory.
+    """
+    # Point the entities to our local fixture of 7 entities
+    url_pat = re.compile(
+        r"https:\/\/data\.opensanctions\.org\/datasets\/[\w-]+\/sanctions\/entities\.ftm\.json"
+    )
+    httpx_mock.add_response(
+        200,
+        url=url_pat,
+        content=(FIXTURES_PATH / "dataset/t1/entities.ftm.json").read_bytes(),
+    )
+    # The catalog index gets a copy of a real index, as seen at test writing time
+    httpx_mock.add_response(
+        200,
+        url="https://data.opensanctions.org/datasets/latest/index.json",
+        content=(FIXTURES_PATH / "dataset/t1/index.json").read_bytes(),
+    )
+    yente.data._catalog = await Catalog.load(
+        Manifest.model_validate(
+            {
+                "catalogs": [
+                    {
+                        "url": "https://data.opensanctions.org/datasets/latest/index.json",
+                        "scope": "sanctions",
+                        "resource_name": "entities.ftm.json",
+                    }
+                ],
+            }
+        )
+    )
+    catalog = await get_catalog()
+    dataset = catalog.get("sanctions")
+    assert dataset is not None
+    updater = await DatasetUpdater.build(dataset, dataset.model.version)
+    assert not updater.needs_update()
+
+    updater = await DatasetUpdater.build(dataset, None)
+    assert not updater.is_incremental
+    assert updater.needs_update()
+    assert updater.delta_urls is None
+
+    operations = [x async for x in updater.load()]
+    assert len(operations) == 7, operations
+    for op in operations:
+        assert op["op"] == "ADD"
+
+    base_version = dataset.model.version
+    dataset.model.version = "20240528134729-3iv"
+    url = f"https://data.opensanctions.org/artifacts/sanctions/{dataset.model.version}/delta.json"
+    dataset.model.delta_url = url
+    delta_index_path = FIXTURES_PATH / "dataset/t2/delta.json"
+
+    index = json.loads(delta_index_path.read_bytes())
+    for version, delta_url in index["versions"].items():
+        if version == base_version:
+            continue
+        httpx_mock.add_response(
+            200,
+            url=delta_url,
+            content=(
+                FIXTURES_PATH / f"dataset/t2/{version}/entities.delta.json"
+            ).read_bytes(),
+        )
+
+    # Point the index to our fixture containing the new versions
+    httpx_mock.add_response(
+        200,
+        url=url,
+        content=delta_index_path.read_bytes(),
+    )
+    updater = await DatasetUpdater.build(dataset, base_version)
+    assert updater.needs_update()
+    assert updater.is_incremental
+    assert updater.delta_urls is not None
+    assert len(updater.delta_urls) == 4
+
+    operations = [x async for x in updater.load()]
+    assert len(operations) == 6, operations
+    ops = {"ADD": 0, "DEL": 0, "MOD": 0}
+    for op in operations:
+        ops[op["op"]] += 1
+
+    assert ops["ADD"] == 4
+    assert ops["DEL"] == 1
+    assert ops["MOD"] == 1
+
+
+@pytest.mark.asyncio
+async def test_updater_checksum_mismatch(httpx_mock: Any) -> None:
+    """
+    The catalog declares a SHA1 for the sanctions entities resource; if the
+    streamed content hashes to anything else, load() must raise ChecksumError.
+    """
+    url_pat = re.compile(
+        r"https:\/\/data\.opensanctions\.org\/datasets\/[\w-]+\/sanctions\/entities\.ftm\.json"
+    )
+    mismatched = (FIXTURES_PATH / "dataset/t1/entities.ftm.json").read_bytes() + b"\n"
+    httpx_mock.add_response(200, url=url_pat, content=mismatched)
+    httpx_mock.add_response(
+        200,
+        url="https://data.opensanctions.org/datasets/latest/index.json",
+        content=(FIXTURES_PATH / "dataset/t1/index.json").read_bytes(),
+    )
+    yente.data._catalog = await Catalog.load(
+        Manifest.model_validate(
+            {
+                "catalogs": [
+                    {
+                        "url": "https://data.opensanctions.org/datasets/latest/index.json",
+                        "scope": "sanctions",
+                        "resource_name": "entities.ftm.json",
+                    }
+                ],
+            }
+        )
+    )
+    catalog = await get_catalog()
+    dataset = catalog.get("sanctions")
+    assert dataset is not None
+    assert dataset.model.entities_checksum is not None
+
+    updater = await DatasetUpdater.build(dataset, None)
+    with pytest.raises(ChecksumError):
+        [x async for x in updater.load()]
+
+
+def test_parse_index_name():
+    """Test parse_index_name function with both happy case and error case."""
+    # Happy case: build an index name and then parse it
+    dataset_name = "test_dataset"
+    dataset_version = "20240528134729-abc"
+
+    # Build the index name
+    index_name = build_index_name(dataset_name, dataset_version)
+
+    # Parse the index name
+    index_info = parse_index_name(index_name)
+
+    # Verify the parsed information
+    assert index_info.dataset_name == dataset_name
+    assert index_info.dataset_version == dataset_version
+
+    # Error case: test that build_index_name raises an error when YENTE_INDEX_REBUILD_ID contains a dash
+    with pytest.MonkeyPatch().context() as m:
+        # Patch the import of settings in the versions module
+        m.setattr("yente.search.versions.settings.INDEX_REBUILD_ID", "-x")
+        get_system_version.cache_clear()
+
+        # This should raise an error because the system version contains a dash, messing with splitting
+        with pytest.raises(AssertionError):
+            build_index_name(dataset_name, dataset_version)

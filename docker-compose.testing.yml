@@ -1,0 +1,15 @@
+services:
+  index:
+    extends:
+      file: docker-compose.yml
+      service: index
+
+  app:
+    extends:
+      file: docker-compose.yml
+      service: app
+    environment:
+      YENTE_MANIFEST: /app/manifests/civic.yml
+
+volumes:
+  index-os-data: null

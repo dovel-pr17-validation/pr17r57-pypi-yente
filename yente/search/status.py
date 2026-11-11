@@ -1,0 +1,30 @@
+from yente import settings
+from yente.data.manifest import Catalog
+from yente.logs import get_logger
+from yente.provider import SearchProvider
+from yente.search.versions import parse_index_name
+
+log = get_logger(__name__)
+
+
+async def sync_dataset_versions(provider: SearchProvider, catalog: Catalog) -> None:
+    """For each dataset in the catalog, look at the currently aliased index in
+    ElasticSearch and update the dataset's `index_version` attribute on the
+    in-memory catalog to match the version embedded in that index name."""
+    for aliased_index in await provider.get_alias_indices(settings.ENTITY_INDEX):
+        try:
+            index_info = parse_index_name(aliased_index)
+        except ValueError:
+            log.warning(f"Invalid index name: {aliased_index}")
+            continue
+        dataset = catalog.get(index_info.dataset_name)
+        if dataset is None:
+            log.warning(f"Dataset has index but no metadata: {index_info.dataset_name}")
+            continue
+        if index_info.dataset_version != dataset.model.version:
+            log.info(
+                f"Dataset {index_info.dataset_name} is outdated",
+                indexed=index_info.dataset_version,
+                available=dataset.model.version,
+            )
+        dataset.model.index_version = index_info.dataset_version

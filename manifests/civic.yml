@@ -1,0 +1,16 @@
+catalogs:
+  - url: "https://data.opensanctions.org/datasets/latest/index.json"
+    scope: default
+    resource_name: entities.ftm.json
+
+  # Example of an alternative catalog source, loading only specific datasets
+  # from a catalog:
+  #
+  # - url: "https://data.opensanctions.org/datasets/latest/banks/catalog.json"
+  #   scopes:
+  #     - ru_egrul
+  #     - icij_offshoreleaks
+  #     - gleif
+  #   resource_name: entities.ftm.json
+  #   namespace: true
+datasets: []

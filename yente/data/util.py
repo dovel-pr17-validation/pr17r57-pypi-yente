@@ -1,0 +1,157 @@
+import warnings
+from collections.abc import AsyncGenerator, Generator
+from contextlib import asynccontextmanager
+from functools import cache
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
+
+import httpx
+from followthemoney import EntityProxy, Property, Schema, registry
+from followthemoney.util import sanitize_text
+from prefixdate.precision import Precision
+from rigour.names import Symbol
+from rigour.time import iso_datetime
+
+from yente import settings
+from yente.logs import get_logger
+
+log = get_logger(__name__)
+
+
+# A set of symbol categories that we don't want to match on and therefore don't want to index.
+NON_MATCHABLE_SYMBOLS = {Symbol.Category.INITIAL}
+
+# Deletion budget of a name part by its length, the same bands as Elasticsearch
+# fuzziness `AUTO`: no edits up to 2 characters, one from 3, two from 6.
+VARIANT_ONE_DELETION_LENGTH = 3
+VARIANT_TWO_DELETIONS_LENGTH = 6
+VARIANT_MAX_LENGTH = 64
+
+
+def extract_values(values: Any) -> list[str]:
+    """Extract a list of string values from a property value, which may be a string or a list."""
+    sanitized: list[str | None] = []
+    if isinstance(values, (list, tuple, set)):
+        sanitized = [sanitize_text(v) for v in values]
+    else:
+        sanitized = [sanitize_text(values)]
+    return [v for v in sanitized if v is not None and len(v) > 0]
+
+
+def index_symbols(symbols: set[Symbol]) -> Generator[str, None, None]:
+    """Get the set of symbols to be indexed for a given name."""
+    for symbol in symbols:
+        if symbol.category not in NON_MATCHABLE_SYMBOLS:
+            yield f"{symbol.category.value}:{symbol.id}"
+
+
+def name_part_variants(part: str) -> set[str]:
+    """Generate the deletion variants of a comparable name part.
+
+    Use the same keys when indexing and querying to retrieve misspelled names.
+    Parts of 3–5 characters allow one deletion, 6–64 allow two. Outside those
+    bands, return only the original part to avoid quadratic expansion of long tokens.
+    """
+    variants = {part}
+    if len(part) < VARIANT_ONE_DELETION_LENGTH or len(part) > VARIANT_MAX_LENGTH:
+        return variants
+    for i in range(len(part)):
+        variants.add(part[:i] + part[i + 1 :])
+    if len(part) < VARIANT_TWO_DELETIONS_LENGTH:
+        return variants
+    for i in range(len(part)):
+        for j in range(i + 1, len(part)):
+            variants.add(part[:i] + part[i + 1 : j] + part[j + 1 :])
+    return variants
+
+
+@cache
+def _entity_weak_props(schema: Schema) -> set[Property]:
+    """Get the set of properties that are not used for matching but can be used for
+    display."""
+    weak_props: set[Property] = set()
+    for prop in schema.properties.values():
+        if prop.type == registry.name and not prop.matchable:
+            weak_props.add(prop)
+    return weak_props
+
+
+def entity_weak_names(entity: EntityProxy) -> set[str]:
+    """Get a set of weak names for an entity, which are the names that are not used for
+    matching but can be used for display."""
+    weak_names: set[str] = set()
+    for prop in _entity_weak_props(entity.schema):
+        for value in entity.get_prop(prop):
+            weak_names.add(value.casefold())
+    return weak_names
+
+
+def expand_dates(dates: list[str]) -> list[str]:
+    """Expand a date into less precise versions of itself."""
+    expanded = set(dates)
+    for date in dates:
+        for prec in (Precision.DAY, Precision.MONTH, Precision.YEAR):
+            if len(date) > prec.value:
+                expanded.add(date[: prec.value])
+    return list(expanded)
+
+
+def iso_to_version(value: str) -> str | None:
+    ## Phase this out - it won't be used in new FtM metadata, is used by yente
+    dt = iso_datetime(value)
+    if dt is not None:
+        return dt.strftime("%Y%m%d%H%M%S")
+    return None
+
+
+def get_url_local_path(url: str) -> Path | None:
+    """Check if a given URL is local file path."""
+    parsed = urlparse(url)
+    scheme = parsed.scheme.lower()
+    if scheme in ("file", "") and parsed.path != "":
+        path = Path(parsed.path).resolve()
+        if not path.exists():
+            raise RuntimeError(f"File not found: {path}")
+        return path
+    return None
+
+
+class Authenticator(httpx.Auth):
+    def __init__(self, auth_token: str | None = None):
+        self.auth_token = auth_token
+
+    def auth_flow(
+        self, request: httpx.Request
+    ) -> Generator[httpx.Request, httpx.Response, None]:
+        if self.auth_token:
+            request.headers["Authorization"] = f"Token {self.auth_token}"
+
+        if settings.DATA_TOKEN is not None:
+            warnings.warn(
+                "settings.DATA_TOKEN (which sets the Authentication header) is deprecated "
+                "and will be removed in a future release of Yente. Use auth_token in "
+                "manifest instead (which sets the Authorization header).",
+                DeprecationWarning,
+            )
+            request.headers["Authentication"] = f"Token {settings.DATA_TOKEN}"
+        yield request
+
+
+@asynccontextmanager
+async def httpx_session(
+    auth_token: str | None = None,
+) -> AsyncGenerator[httpx.AsyncClient, None]:
+    transport = httpx.AsyncHTTPTransport(retries=3)
+    proxy = settings.HTTP_PROXY if settings.HTTP_PROXY != "" else None
+    headers = {"User-Agent": f"Yente/{settings.VERSION}"}
+    async with httpx.AsyncClient(
+        transport=transport,
+        http2=True,
+        timeout=None,
+        proxy=proxy,
+        headers=headers,
+        auth=Authenticator(auth_token),
+        follow_redirects=True,
+    ) as client:
+        yield client

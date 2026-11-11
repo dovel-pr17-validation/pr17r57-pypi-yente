@@ -1,0 +1,311 @@
+import asyncio
+from collections.abc import Coroutine, Sequence
+from typing import Annotated, Any
+
+from fastapi import APIRouter, HTTPException, Query, Request, Response
+from nomenklatura.matching.types import ScoringConfig
+
+from yente import settings
+from yente.data.common import (
+    EntityExample,
+    EntityMatches,
+    EntityMatchQuery,
+    EntityMatchResponse,
+    ErrorResponse,
+    TotalSpec,
+)
+from yente.data.dataset import Dataset
+from yente.data.entity import Entity
+from yente.logs import get_logger
+from yente.provider import SearchProvider
+from yente.routers.util import (
+    ALGO_HELP,
+    TS_PATTERN,
+    DatasetPath,
+    ProviderDep,
+    get_algorithm_by_name,
+    get_dataset,
+)
+from yente.scoring import score_results
+from yente.search.queries import (
+    DEFAULT_SORTS,
+    Filters,
+    FilterSpec,
+    Operator,
+    entity_query,
+)
+from yente.search.search import result_entities, search_entities
+from yente.util import limit_window
+
+log = get_logger(__name__)
+router = APIRouter()
+
+
+async def _match_one_query(
+    ds: Dataset,
+    algorithm: str,
+    match: EntityMatchQuery,
+    name: str,
+    example: EntityExample,
+    filters: Filters,
+    include_dataset: Sequence[str],
+    exclude_schema: Sequence[str],
+    exclude_dataset: Sequence[str],
+    changed_since: str | None,
+    exclude_entity_ids: Sequence[str],
+    provider: SearchProvider,
+    candidates: int,
+    limit: int,
+    cutoff: float,
+    threshold: float,
+) -> tuple[str, EntityMatches]:
+    """Run a single match query and return the results. This run as one big async process per query in the batch,
+    and all queries are triggered simultaneously. Previous yente versions used to do all searches concurrently
+    but score sequentially - but this meant that scoring would not start before the slowest ES query returned.
+    """
+    try:
+        entity = Entity.from_example(example)
+        query = entity_query(
+            ds,
+            entity,
+            filters=filters,
+            filter_op=Operator.OR,
+            include_dataset=include_dataset,
+            exclude_schema=exclude_schema,
+            exclude_dataset=exclude_dataset,
+            changed_since=changed_since,
+            exclude_entity_ids=exclude_entity_ids,
+        )
+    # Any failure to build a query from the example is the client's fault.
+    except Exception as exc:  # noqa: BLE001
+        log.info(f"Cannot parse example entity: {exc!s}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot parse example entity: {exc}",
+        )
+    # The response total is the number of scored results, so the candidate
+    # query never reads hits.total; skipping the count lets the backend
+    # prune non-competitive documents early.
+    search_result = await search_entities(
+        provider, query, limit=candidates, sort=DEFAULT_SORTS, track_total_hits=False
+    )
+    ents = result_entities(search_result)
+    algorithm_type = get_algorithm_by_name(algorithm)
+    total, scored = await score_results(
+        algorithm_type,
+        entity,
+        ents,
+        threshold=threshold,
+        cutoff=cutoff,
+        limit=limit,
+        config=ScoringConfig(weights=match.weights, config=match.config),
+    )
+    log.info(
+        f"/match/{ds.name}",
+        action="match",
+        schema=entity.schema.name,
+        results=total,
+        threshold=threshold,
+        dataset=ds.name,
+        limit=limit,
+        # Log the algorithm passed in the request, which may be None or "best"
+        algorithm_param=algorithm,
+    )
+    # Restore the caller-supplied id on the echoed query only. The internal
+    # entity keeps its checksum-derived id so scoring/candidate-dedup can't
+    # be influenced by a caller picking an id that collides with a real
+    # dataset entity.
+    parsed = EntityExample(
+        id=example.id,
+        schema=entity.schema.name,
+        properties=dict(entity.properties),
+    )
+    matches = EntityMatches(
+        status=200,
+        results=scored,
+        total=TotalSpec(value=total, relation="eq"),
+        query=parsed,
+    )
+    return (name, matches)
+
+
+@router.post(
+    "/match/{dataset}",
+    summary="Query by example matcher",
+    tags=["Matching"],
+    response_model=EntityMatchResponse,
+    responses={
+        400: {"model": ErrorResponse, "description": "Invalid query"},
+        500: {"model": ErrorResponse, "description": "Server error"},
+    },
+)
+async def match(
+    request: Request,
+    response: Response,
+    match: EntityMatchQuery,
+    provider: ProviderDep,
+    dataset: DatasetPath,
+    limit: Annotated[
+        int, Query(title="Number of results to return", le=settings.MAX_MATCHES)
+    ] = settings.MATCH_PAGE,
+    threshold: Annotated[
+        float,
+        Query(title="Score threshold for results to be considered matches"),
+    ] = settings.SCORE_THRESHOLD,
+    cutoff: Annotated[
+        float,
+        Query(
+            deprecated=True,
+            title="Deprecated, use `threshold` instead. Lower bound of score for results to be returned at all",
+        ),
+    ] = settings.SCORE_THRESHOLD,
+    algorithm: Annotated[str, Query(title=ALGO_HELP)] = settings.DEFAULT_ALGORITHM,
+    include_dataset: Annotated[
+        tuple[str, ...],
+        Query(title="Only include the given datasets in results"),
+    ] = (),
+    exclude_schema: Annotated[
+        tuple[str, ...],
+        Query(title="Remove the given types of entities from results"),
+    ] = (),
+    exclude_dataset: Annotated[
+        tuple[str, ...],
+        Query(title="Remove the given datasets from results"),
+    ] = (),
+    topics: Annotated[
+        tuple[str, ...],
+        Query(title="Only return results that match any of the given topics"),
+    ] = (),
+    changed_since: Annotated[
+        str | None,
+        Query(
+            pattern=TS_PATTERN,
+            title="Match against entities that were updated since the given date",
+        ),
+    ] = None,
+    # This list applies to all queries, but really only makes sense with a single query.
+    # Our API design currently doesn't support per-query options such as this one.
+    exclude_entity_ids: Annotated[
+        tuple[str, ...],
+        Query(
+            title="A list of entities IDs to exclude from matching",
+            description="The entity IDs supplied here do not have to be canonical. Supplying any of the referents of a merged entity will exclude that entity. This parameter may be useful for example to exclude false-positive matches that have been decided upon by a human.",
+            max_length=50,
+        ),
+    ] = (),
+) -> EntityMatchResponse:
+    """Match entities based on a complex set of criteria, like name, date of birth
+    and nationality of a person. This works by submitting an entity formatted like
+    those returned by the API.
+
+    Tutorials:
+    * [Using the matching API](https://www.opensanctions.org/docs/api/matching/)
+    * [Configuring the scoring system](https://www.opensanctions.org/docs/api/scoring/)
+
+    For example, the following would be a valid query:
+
+    ```json
+    "queries": {
+        "q": {
+            "schema": "Person",
+            "properties": {
+                "name": ["John Doe"],
+                "birthDate": ["1975-04-21"],
+                "nationality": ["us"]
+            }
+        }
+    }
+    ```
+    The value for `q` can be chosen freely to correlate the result on the
+    client side when the request is returned. The response will be given for the
+    submitted example like this:
+
+    ```json
+    "responses": {
+        "q": {
+            "query": {},
+            "results": [...]
+        }
+    }
+    ```
+
+    While more than one query can theoretically be submitted per request,
+    batching is discouraged for performance and scalability reasons.
+
+    The precision of the results will be dependent on the amount of detail submitted
+    with each example. The following properties are most helpful for particular types:
+
+    * **Person**: ``name``, ``birthDate``, ``nationality``, ``idNumber``, ``address``
+    * **Organization**: ``name``, ``country``, ``registrationNumber``, ``address``
+    * **Company**: ``name``, ``jurisdiction``, ``registrationNumber``, ``address``,
+      ``incorporationDate``
+    """
+    ds = await get_dataset(dataset)
+    # TODO: Remove this once get rid of cutoff. For now, make sure that the cutoff
+    # is not greater than the threshold because that would be weird.
+    cutoff = min(cutoff, threshold)
+    filters: list[FilterSpec] = [("topics", t) for t in topics]
+    algorithm_type = get_algorithm_by_name(algorithm)
+
+    for config_key in match.config:
+        if config_key not in algorithm_type.CONFIG:
+            raise HTTPException(
+                400,
+                detail=f"Invalid configuration parameter: {config_key} for algorithm {algorithm_type.NAME}",
+            )
+
+    if len(match.queries) > settings.MAX_BATCH:
+        msg = f"Too many queries in one batch (limit: {settings.MAX_BATCH})"
+        raise HTTPException(400, detail=msg)
+
+    # We're using a higher limit for candidate generation, because we want to
+    # get a broad range of candidates to score against. This is a trade-off
+    # between speed and accuracy.
+    candidates = limit * settings.MATCH_CANDIDATES
+    # We want at least 20 candidates to score to have good results even for limit = 1
+    candidates = max(20, min(settings.MAX_RESULTS, candidates))
+    # We want to retrieve at most MAX_MATCH_CANDIDATES, other wise we will be
+    # very slow or OOM for high values of limit.
+    # But at least `limit` candidates, otherwise we'll run out of results to return.
+    # One day we might drop the max for limit, see https://github.com/opensanctions/yente/issues/927
+    candidates = min(candidates, max(settings.MAX_MATCH_CANDIDATES, limit))
+    # This is more of a formality - candidates will never be >= 10000 (settings.MAX_RESULTS)
+    candidates, _ = limit_window(candidates, 0)
+
+    tasks: list[Coroutine[Any, Any, tuple[str, EntityMatches]]] = []
+    for name, example in match.queries.items():
+        if example is None:
+            continue
+        # TODO: add more arguments here for readability:
+        coroutine = _match_one_query(
+            ds,
+            algorithm,
+            match,
+            name,
+            example,
+            filters,
+            include_dataset,
+            exclude_schema,
+            exclude_dataset,
+            changed_since,
+            exclude_entity_ids,
+            provider,
+            candidates,
+            limit,
+            cutoff,
+            threshold,
+        )
+        tasks.append(coroutine)
+    task_results = await asyncio.gather(*tasks)
+    responses: dict[str, EntityMatches] = {}
+    for name, matches in task_results:
+        responses[name] = matches
+
+    if not len(responses):
+        raise HTTPException(400, detail="No queries provided.")
+
+    response.headers["x-batch-size"] = str(len(responses))
+    return EntityMatchResponse(
+        responses=responses,
+        limit=limit,
+    )

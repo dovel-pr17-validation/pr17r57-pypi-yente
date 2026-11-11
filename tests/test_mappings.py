@@ -1,0 +1,244 @@
+import pytest
+
+from yente import settings
+from yente.data.entity import Entity
+from yente.data.util import name_part_variants
+from yente.search.indexer import build_indexable_entity_doc
+from yente.search.mapping import INDEX_SETTINGS, make_entity_mapping
+
+INDEX_MAPPINGS = make_entity_mapping()
+
+
+@pytest.mark.asyncio
+async def test_mappings_copy_to(search_provider):
+    """Test that all the mapping and indexing magic works.
+
+    We test that by executing queries on specific fields of the indexed documents."""
+    # Create a test index using the same settings as test_search_provider
+    temp_index = settings.ENTITY_INDEX + "-mappings-test"
+    try:
+        await search_provider.create_index(
+            temp_index, mappings=INDEX_MAPPINGS, settings=INDEX_SETTINGS
+        )
+
+        # Create a test entity with Vladimir Putin data
+        entity = Entity.from_dict(
+            {
+                "id": "Q7747",
+                "schema": "Person",
+                "properties": {
+                    "name": ["Vladimir Putin"],
+                    "citizenship": ["ru"],
+                    "topics": ["sanction"],
+                },
+                "datasets": ["test"],
+                "referents": [],
+                "first_seen": "2023-01-01T00:00:00",
+                "last_seen": "2023-01-01T00:00:00",
+                "last_change": "2023-01-01T00:00:00",
+            }
+        )
+
+        action = {
+            "_index": temp_index,
+            "_id": entity.id,
+            "_source": build_indexable_entity_doc(entity),
+        }
+        await search_provider.bulk_index([action])
+        await search_provider.refresh(temp_index)
+
+        # names is a text field, so need to use match
+        search_result = await search_provider.search(
+            temp_index, {"bool": {"must": [{"match": {"names": "Vladimir"}}]}}
+        )
+        assert len(search_result["hits"]["hits"]) == 1, "Failed to match on names"
+
+        # name_parts and name_joined are a bit of a special case, we syntesize them in the indexer
+        search_result = await search_provider.search(
+            temp_index, {"bool": {"must": [{"match": {"name_parts": "Vladimir"}}]}}
+        )
+        assert len(search_result["hits"]["hits"]) == 1, "Failed to match on name_parts"
+        search_result = await search_provider.search(
+            temp_index, {"bool": {"must": [{"term": {"name_joined": "vladimirputin"}}]}}
+        )
+        assert len(search_result["hits"]["hits"]) == 1
+        # A misspelled query part reaches the indexed part through a shared deletion
+        # variant: "pytin" and "putin" both yield "ptin".
+        search_result = await search_provider.search(
+            temp_index,
+            {"bool": {"must": [{"terms": {"name_part_variants": ["ptin", "pyin"]}}]}},
+        )
+        assert len(search_result["hits"]["hits"]) == 1
+        search_result = await search_provider.search(
+            temp_index,
+            {"bool": {"must": [{"terms": {"name_part_variants": ["pyin", "ptn"]}}]}},
+        )
+        assert len(search_result["hits"]["hits"]) == 0
+
+        # Try to match on the countries field, which is a type field that is populated by copy_to from citizenship
+        search_result = await search_provider.search(
+            temp_index, {"bool": {"must": [{"term": {"countries": "ru"}}]}}
+        )
+        assert len(search_result["hits"]["hits"]) == 1, "Failed to match on countries"
+
+        # Try to match on the text field, which is a copy_to field that is populated by just about everything
+        search_result = await search_provider.search(
+            temp_index, {"bool": {"must": [{"term": {"text": "ru"}}]}}
+        )
+        assert len(search_result["hits"]["hits"]) == 1, (
+            "Failed to match country on text"
+        )
+        search_result = await search_provider.search(
+            temp_index, {"bool": {"must": [{"term": {"text": "sanction"}}]}}
+        )
+        assert len(search_result["hits"]["hits"]) == 1, "Failed to match topics on text"
+        search_result = await search_provider.search(
+            temp_index, {"bool": {"must": [{"match": {"text": "vladimir"}}]}}
+        )
+        assert len(search_result["hits"]["hits"]) == 1, "Failed to match name on text"
+    finally:
+        # Clean up the test index
+        await search_provider.delete_index(temp_index)
+
+
+def test_name_part_variants_mapping():
+    mapping = make_entity_mapping()["properties"]
+    assert mapping["name_part_variants"] == {"type": "keyword", "doc_values": False}
+    assert mapping["name_joined"] == {"type": "keyword"}
+    assert "name_part_variants" in make_entity_mapping()["_source"]["excludes"]
+
+
+@pytest.mark.parametrize("length", [64, 65, 384])
+def test_long_name_part_variants_indexed(length):
+    part = ("abcdefgh" * 48)[:length]
+    entity = Entity.from_dict(
+        {
+            "id": f"long-part-{length}",
+            "schema": "Person",
+            "properties": {"name": [part]},
+        }
+    )
+    doc = build_indexable_entity_doc(entity)
+    assert set(doc["name_parts"]) == {part}
+    assert set(doc["name_part_variants"]) == name_part_variants(part)
+    if length > 64:
+        assert doc["name_part_variants"] == [part]
+
+
+def test_colliding_prop_names():
+    """Test that we can handle multiple properties with the same property name."""
+    mapping = make_entity_mapping()
+    # Yo dawg, I heard you like properties
+    prop_mapping = mapping["properties"]["properties"]["properties"]
+    # CallForTenders:authority is an entity, Identification:authority is a string
+    assert set(prop_mapping["authority"]["copy_to"]) == {"text", "entities"}
+    assert prop_mapping["authority"]["type"] == "keyword"
+
+
+@pytest.mark.asyncio
+async def test_name_symbols_indexed_person(search_provider):
+    """Test that name symbols are indexed correctly for people."""
+    entity = Entity.from_dict(
+        {
+            "id": "Q7747",
+            "schema": "Person",
+            "properties": {
+                "name": ["Vladimir Putin"],
+                "citizenship": ["ru"],
+                "topics": ["sanction"],
+            },
+            "datasets": ["test"],
+            "referents": [],
+            "first_seen": "2023-01-01T00:00:00",
+            "last_seen": "2023-01-01T00:00:00",
+            "last_change": "2023-01-01T00:00:00",
+        }
+    )
+
+    doc = build_indexable_entity_doc(entity)
+
+    assert "NAME:KHUYLO" in doc["name_symbols"]  # Putin
+
+
+def test_name_symbols_indexed_org(search_provider):
+    """Test that name symbols are indexed correctly for organizations."""
+    entity = Entity.from_dict(
+        {
+            "id": "Q1234",
+            "schema": "Company",
+            "properties": {
+                "name": ["Gazprom Bank OOO"],
+                "topics": ["sanction"],
+            },
+            "datasets": ["test"],
+            "referents": [],
+            "first_seen": "2023-01-01T00:00:00",
+            "last_seen": "2023-01-01T00:00:00",
+            "last_change": "2023-01-01T00:00:00",
+        }
+    )
+
+    doc = build_indexable_entity_doc(entity)
+
+    assert "ORGCLS:LLC" in doc["name_symbols"]
+    assert "DOMAIN:BANK" in doc["name_symbols"]
+
+
+def test_name_joined_indexed():
+    entity = Entity.from_dict(
+        {
+            "id": "Q7747",
+            "schema": "Person",
+            "properties": {
+                "name": ["Vladimir V. Putin"],
+                "alias": ["Владимир Путин"],
+                "weakAlias": ["Vova"],
+                "citizenship": ["ru"],
+                "topics": ["sanction"],
+            },
+        }
+    )
+
+    doc = build_indexable_entity_doc(entity)
+
+    assert set(doc["name_joined"]) == {"vladimirvputin", "vladimirputin"}
+    assert "vova" in doc["name_parts"]
+    assert "name_phonetic" not in doc
+
+
+def test_name_part_variants_indexed():
+    entity = Entity.from_dict(
+        {
+            "id": "Q7747",
+            "schema": "Person",
+            "properties": {
+                "name": ["Vladimir V. Putin"],
+                "alias": ["Владимир Путин"],
+                "weakAlias": ["Vova"],
+            },
+        }
+    )
+
+    doc = build_indexable_entity_doc(entity)
+
+    variants = set(doc["name_part_variants"])
+    assert variants == name_part_variants("vladimir") | name_part_variants("putin") | {
+        "v"
+    }
+    # Weak aliases go into name_parts only.
+    assert "vova" not in variants
+    assert "ova" not in variants
+
+
+def test_name_joined_indexed_org():
+    entity = Entity.from_dict(
+        {
+            "id": "Q1234",
+            "schema": "Company",
+            "properties": {"name": ["Al-Qaeda Trading LLC"]},
+        }
+    )
+
+    doc = build_indexable_entity_doc(entity)
+
+    assert "alqaedatradingllc" in doc["name_joined"]
